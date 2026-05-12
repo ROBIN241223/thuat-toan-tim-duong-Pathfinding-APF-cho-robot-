@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UAV Ultimate 5-in-1 Simulator (Included Physics MPC)</title>
+    <style>
+        body { background-color: #1a1e23; color: white; font-family: 'Segoe UI', sans-serif; text-align: center; margin: 10px; }
+        .toolbar { background-color: #2c313a; padding: 12px; border-radius: 8px; display: inline-block; margin-bottom: 10px; text-align: left; border: 1px solid #3d4450; width: 850px; }
+        button, select { padding: 8px 12px; margin: 0 5px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; color: #fff; background-color: #34495e; font-family: inherit;}
+        #btn-start { background-color: #2ecc71; }
+        #btn-reset { background-color: #e74c3c; }
+        select { background-color: #f39c12; outline: none; font-weight: bold;}
+        canvas { background-color: #ffffff; border-radius: 4px; cursor: crosshair; display: block; margin: 0 auto; box-shadow: 0 0 25px rgba(0,0,0,0.6); }
+        .status-bar { background-color: #000; color: #00ff00; padding: 12px; margin-top: 10px; border: 1px solid #00bfff; border-radius: 4px; display: inline-block; font-family: 'Courier New', monospace; min-width: 850px; font-size: 14px; }
+        .filter-info { font-size: 13px; color: #f1c40f; margin-left: 10px; font-weight: bold; display: inline-block; margin-top: 5px;}
+        .mpc-controls { background-color: #1abc9c; padding: 5px 10px; border-radius: 4px; color: #000; display: none; }
+        input[type=range] { vertical-align: middle; }
+    </style>
+</head>
+<body>
+
+    <h2>Hệ Thống Mô Phỏng 5 Thuật Toán Điều Hướng UAV</h2>
+    
+    <div class="toolbar">
+        <select id="algoSelect">
+            <option value="lazy">1. Lazy Theta* (Tối ưu CPU/RAM)</option>
+            <option value="dynamic">2. Dynamic Re-plan (Mô phỏng D* Lite)</option>
+            <option value="fixedwing">3. Fixed-wing Curves (Hybrid A*)</option>
+            <option value="rrt">4. RRT* (Rapidly-exploring Random Tree)</option>
+            <option value="mpc">5. MPC Dynamics (Realtime + Gió + Khối lượng)</option>
+        </select>
+        <button id="btn-start">🚀 Bay Ngay</button>
+        <button id="btn-reset">🔄 Xóa Map</button>
+        <label><input type="radio" name="mode" value="obstacle" checked> 🧱 Vật Cản</label>
+        <label><input type="radio" name="mode" value="target"> 🎯 Đổi Đích</label>
+        <span class="filter-info">
+            Sải cánh: <input type="range" id="safetySlider" min="10" max="40" value="20"> <span id="safetyVal">20px</span>
+        </span>
+        <br>
+        <div id="mpc-controls-panel" class="filter-info mpc-controls">
+            ⚖️ Khối lượng: <input type="range" id="massSlider" min="1" max="20" value="5"> <span id="massVal">5kg</span> | 
+            💨 Tốc độ Gió: <input type="range" id="windSpeedSlider" min="0" max="15" value="2"> <span id="windSpeedVal">2</span> | 
+            🧭 Hướng Gió: <input type="range" id="windAngleSlider" min="0" max="360" value="90"> <span id="windAngleVal">90°</span>
+        </div>
+    </div>
+
+    <canvas id="simCanvas" width="900" height="500"></canvas>
+
+    <div class="status-bar">
+        <span id="txt-algo">Thuật toán: Lazy Theta*</span> | 
+        <span id="txt-dist">Dist: 0m</span> | 
+        <span id="txt-state">SYSTEM READY</span>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('simCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        const GRID = 50, OFFSET = 50; 
+        const ORIGIN_X = OFFSET, ORIGIN_Y = canvas.height - OFFSET;
+
+        // Trạng thái hệ thống và vật lý
+        let uav = { x: 100, y: 400, speed: 4, theta: 0 }; 
+        let startPos = { x: 100, y: 400 };
+        let target = { x: 800, y: 100 };
+        let obstacles = [];
+        let safetyMargin = 20;
+        
+        // Model động lực học cho MPC
+        let physics = {
+            mass: 5.0,
+            windSpeed: 2.0,
+            windAngle: 90 * Math.PI / 180,
+            vx: 0,
+            vy: 0
+        };
+
+        let isFlying = false;
+        let isPlanning = false;
+        let globalPath = [];
+        let renderPath = []; 
+        let currentWP = 0;
+        let currentAlgo = 'lazy';
+
+        let rrtNodes = [];
+        let rrtAnimId = null;
+        class Node { constructor(x, y) { this.x = x; this.y = y; this.parent = null; this.cost = 0; } }
+
+        // --- SỰ KIỆN UI CHUYỂN ĐỔI ---
+        document.getElementById('algoSelect').onchange = (e) => {
+            currentAlgo = e.target.value;
+            document.getElementById('txt-algo').innerText = `Thuật toán: ${e.target.options[e.target.selectedIndex].text}`;
+            
+            // Hiển thị panel vật lý nếu là MPC
+            document.getElementById('mpc-controls-panel').style.display = currentAlgo === 'mpc' ? 'inline-block' : 'none';
+            
+            if(rrtAnimId) cancelAnimationFrame(rrtAnimId);
+            isPlanning = false;
+            
+            // Xoay mũi máy bay về phía đích mỗi khi đổi thuật toán và reset động năng
+            uav.theta = Math.atan2(target.y - uav.y, target.x - uav.x);
+            physics.vx = 0; physics.vy = 0;
+            
+            if (!isFlying) predictTrajectory(uav);
+        };
+
+        // UI Vật lý
+        document.getElementById('massSlider').oninput = (e) => { physics.mass = parseFloat(e.target.value); document.getElementById('massVal').innerText = e.target.value + "kg"; draw(); };
+        document.getElementById('windSpeedSlider').oninput = (e) => { physics.windSpeed = parseFloat(e.target.value); document.getElementById('windSpeedVal').innerText = e.target.value; draw(); };
+        document.getElementById('windAngleSlider').oninput = (e) => { physics.windAngle = parseInt(e.target.value) * Math.PI / 180; document.getElementById('windAngleVal').innerText = e.target.value + "°"; draw(); };
+
+        // --- CÁC HÀM CƠ BẢN ---
+        function isPathClear(p1, p2) {
+            let dx = p2.x - p1.x, dy = p2.y - p1.y;
+            let dist = Math.hypot(dx, dy);
+            let steps = Math.ceil(dist / 4); 
+            for (let i = 0; i <= steps; i++) {
+                let cx = p1.x + dx * (i/steps), cy = p1.y + dy * (i/steps);
+                for (let obs of obstacles) {
+                    if (Math.hypot(cx - obs.x, cy - obs.y) < obs.r + safetyMargin) return false;
+                }
+            }
+            return true;
+        }
+
+        // --- 1. THETA* / A* LOGIC ---
+        function calculatePath(startPoint, endPoint) {
+            if (isPathClear(startPoint, endPoint)) return [endPoint];
+            let step = 20;
+            let openList = [{x: startPoint.x, y: startPoint.y, g: 0, h: Math.hypot(startPoint.x-endPoint.x, startPoint.y-endPoint.y), parent: null}];
+            let closedList = new Set();
+            let found = null;
+
+            while (openList.length > 0) {
+                openList.sort((a, b) => (a.g + a.h) - (b.g + b.h));
+                let curr = openList.shift();
+                let key = `${Math.round(curr.x/10)*10},${Math.round(curr.y/10)*10}`;
+
+                if (currentAlgo === 'lazy' && curr.parent && !isPathClear(curr.parent, curr)) {
+                    curr.parent = null; curr.g = Infinity; continue;
+                }
+
+                if (Math.hypot(curr.x - endPoint.x, curr.y - endPoint.y) < step * 1.5) { found = curr; break; }
+                if (closedList.has(key)) continue;
+                closedList.add(key);
+
+                for (let dx = -step; dx <= step; dx += step) {
+                    for (let dy = -step; dy <= step; dy += step) {
+                        if (dx === 0 && dy === 0) continue;
+                        let nx = curr.x + dx, ny = curr.y + dy;
+                        if (nx > ORIGIN_X && nx < canvas.width && ny > 0 && ny < ORIGIN_Y) {
+                            let newNode = { x: nx, y: ny, g: curr.g + Math.hypot(dx, dy), h: Math.hypot(nx-endPoint.x, ny-endPoint.y), parent: curr };
+                            if (curr.parent && isPathClear(curr.parent, newNode)) {
+                                newNode.parent = curr.parent;
+                                newNode.g = curr.parent.g + Math.hypot(newNode.x - curr.parent.x, newNode.y - curr.parent.y);
+                            }
+                            if(currentAlgo !== 'lazy' && !isPathClear(curr, newNode)) continue;
+                            openList.push(newNode);
+                        }
+                    }
+                }
+            }
+
+            if (!found) return [];
+            let path = [];
+            while (found) { path.unshift({x: found.x, y: found.y}); found = found.parent; }
+            path.push({x: endPoint.x, y: endPoint.y});
+
+            let smoothed = [path[0]];
+            let ci = 0;
+            while (ci < path.length - 1) {
+                let bi = ci + 1;
+                for (let i = path.length - 1; i > ci; i--) {
+                    if (isPathClear(path[ci], path[i])) { bi = i; break; }
+                }
+                smoothed.push(path[bi]); ci = bi;
+            }
+            return smoothed.slice(1);
+        }
+
+        function generateFixedWingCurves(waypoints) {
+            if(waypoints.length < 2) return waypoints;
+            let curvedPath = [];
+            for(let i = 0; i < waypoints.length; i++) curvedPath.push(waypoints[i]);
+            return curvedPath;
+        }
+
+        // --- 2. RRT* LOGIC ---
+        function startRRT(startP) {
+            if(rrtAnimId) cancelAnimationFrame(rrtAnimId);
+            rrtNodes = [new Node(startP.x, startP.y)];
+            globalPath = []; renderPath = []; isPlanning = true;
+            document.getElementById('txt-state').innerText = "ĐANG TÍNH TOÁN RRT*...";
+            planRRTStep();
+        }
+
+        function planRRTStep() {
+            if (!isPlanning) return;
+            for(let iter = 0; iter < 20; iter++) {
+                if (rrtNodes.length >= 1000) {
+                    isPlanning = false; extractRRTPath(); draw(); return;
+                }
+                let rx, ry;
+                if (Math.random() < 0.1) { rx = target.x; ry = target.y; }
+                else { rx = ORIGIN_X + Math.random() * (canvas.width - ORIGIN_X); ry = Math.random() * ORIGIN_Y; }
+
+                let nearest = rrtNodes[0];
+                let minDist = Math.hypot(nearest.x - rx, nearest.y - ry);
+                for (let n of rrtNodes) {
+                    let d = Math.hypot(n.x - rx, n.y - ry);
+                    if (d < minDist) { minDist = d; nearest = n; }
+                }
+
+                let theta = Math.atan2(ry - nearest.y, rx - nearest.x);
+                let nx = nearest.x + Math.cos(theta) * 30, ny = nearest.y + Math.sin(theta) * 30;
+                let newNode = new Node(nx, ny);
+
+                if (nx > ORIGIN_X && nx < canvas.width && ny > 0 && ny < ORIGIN_Y && isPathClear(nearest, newNode)) {
+                    let bestParent = nearest;
+                    let minCost = nearest.cost + Math.hypot(nearest.x - nx, nearest.y - ny);
+                    let neighborhood = rrtNodes.filter(n => Math.hypot(n.x - nx, n.y - ny) < 60 && isPathClear(n, newNode));
+                    
+                    for (let n of neighborhood) {
+                        let cost = n.cost + Math.hypot(n.x - nx, n.y - ny);
+                        if (cost < minCost) { bestParent = n; minCost = cost; }
+                    }
+                    newNode.parent = bestParent; newNode.cost = minCost;
+                    rrtNodes.push(newNode);
+
+                    for (let n of neighborhood) {
+                        let rewireCost = newNode.cost + Math.hypot(newNode.x - n.x, newNode.y - n.y);
+                        if (rewireCost < n.cost && isPathClear(newNode, n)) { n.parent = newNode; n.cost = rewireCost; }
+                    }
+
+                    if (Math.hypot(newNode.x - target.x, newNode.y - target.y) < 30) {
+                        isPlanning = false; extractRRTPath(newNode);
+                        document.getElementById('txt-state').innerText = "RRT* ĐÃ HOÀN THÀNH"; draw(); return;
+                    }
+                }
+            }
+            draw(); rrtAnimId = requestAnimationFrame(planRRTStep);
+        }
+
+        function extractRRTPath(lastNode) {
+            let path = [], curr = lastNode;
+            if (!curr) {
+                let close = rrtNodes.filter(n => isPathClear(n, target));
+                if (close.length > 0) curr = close.reduce((min, n) => n.cost < min.cost ? n : min, close[0]);
+            }
+            while(curr) { path.unshift({x: curr.x, y: curr.y}); curr = curr.parent; }
+            path.push({x: target.x, y: target.y});
+
+            if(path.length > 1) {
+                let smoothed = [path[0]], ci = 0;
+                while (ci < path.length - 1) {
+                    let bi = ci + 1;
+                    for (let i = path.length - 1; i > ci; i--) {
+                        if (isPathClear(path[ci], path[i])) { bi = i; break; }
+                    }
+                    smoothed.push(path[bi]); ci = bi;
+                }
+                globalPath = smoothed.slice(1);
+            } else globalPath = [];
+            renderPath = globalPath; currentWP = 0;
+        }
+
+        // --- 3. MPC LOGIC (BỔ SUNG VẬT LÝ MASS & WIND) ---
+        function solveMPC() {
+            let bestCost = Infinity;
+            let bestAction = 0;
+            let bestPath = [];
+            let maxSteer = 45 * Math.PI / 180; 
+            let horizon = 30; // Nhìn xa hơn chút để bù trừ quán tính
+
+            let wx = physics.windSpeed * Math.cos(physics.windAngle);
+            let wy = physics.windSpeed * Math.sin(physics.windAngle);
+
+            for (let i = 0; i < 60; i++) { 
+                let simX = uav.x, simY = uav.y, simTheta = uav.theta;
+                let simVx = physics.vx, simVy = physics.vy; // Khởi tạo với quán tính hiện tại
+                let path = [];
+                let cost = 0;
+                let firstAction = 0;
+                let collided = false;
+
+                for (let t = 0; t < horizon; t++) {
+                    let steer = (Math.random() * 2 - 1) * maxSteer;
+                    if (t === 0) firstAction = steer;
+
+                    simTheta += steer * 0.15;
+                    
+                    // Lực đẩy động cơ
+                    let thrustX = uav.speed * Math.cos(simTheta);
+                    let thrustY = uav.speed * Math.sin(simTheta);
+
+                    // Cập nhật gia tốc và vận tốc (Kèm ma sát/cản gió cơ bản 0.9)
+                    simVx = (simVx * 0.9) + (thrustX / physics.mass) + (wx * 0.1);
+                    simVy = (simVy * 0.9) + (thrustY / physics.mass) + (wy * 0.1);
+
+                    simX += simVx;
+                    simY += simVy;
+                    path.push({x: simX, y: simY});
+
+                    // Phạt va chạm
+                    for(let obs of obstacles) {
+                        if(Math.hypot(simX - obs.x, simY - obs.y) < obs.r + safetyMargin) {
+                            collided = true; break;
+                        }
+                    }
+                    if (collided) { cost += 99999; break; }
+
+                    // Hình phạt mục tiêu
+                    cost += Math.hypot(target.x - simX, target.y - simY) * 0.2; 
+                    cost += Math.abs(steer) * 20; 
+                }
+                
+                if(!collided) cost += Math.hypot(target.x - simX, target.y - simY) * 5; 
+
+                if (cost < bestCost) {
+                    bestCost = cost; bestAction = firstAction; bestPath = path;
+                }
+            }
+            return {bestAction, bestPath};
+        }
+
+
+        // --- LUỒNG CHÍNH ĐIỀU PHỐI ---
+        function predictTrajectory(startP) {
+            if (isPlanning) return;
+            
+            if (currentAlgo === 'mpc') {
+                globalPath = []; renderPath = [];
+                document.getElementById('txt-state').innerText = "MPC SẴN SÀNG (Nhấn Bay để tự lái)";
+                draw();
+            } else if (currentAlgo === 'rrt') {
+                startRRT(startP);
+            } else {
+                globalPath = calculatePath(startP, target);
+                currentWP = 0;
+                if(currentAlgo === 'fixedwing') renderPath = generateFixedWingCurves(globalPath);
+                else renderPath = globalPath;
+                draw();
+            }
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // Lưới & Trục
+            ctx.beginPath(); ctx.strokeStyle = "#eee"; ctx.lineWidth = 1;
+            for (let x = ORIGIN_X; x <= canvas.width; x += GRID) { ctx.moveTo(x, 0); ctx.lineTo(x, ORIGIN_Y); }
+            for (let y = ORIGIN_Y; y >= 0; y -= GRID) { ctx.moveTo(ORIGIN_X, y); ctx.lineTo(canvas.width, y); }
+            ctx.stroke();
+            ctx.beginPath(); ctx.strokeStyle = "#2c3e50"; ctx.lineWidth = 2;
+            ctx.moveTo(ORIGIN_X, 0); ctx.lineTo(ORIGIN_X, ORIGIN_Y); ctx.lineTo(canvas.width, ORIGIN_Y); ctx.stroke();
+
+            // Hiệu ứng biểu diễn luồng gió (Chỉ hiển thị khi có gió ở mode MPC)
+            if (currentAlgo === 'mpc' && physics.windSpeed > 0) {
+                ctx.strokeStyle = 'rgba(52, 152, 219, 0.2)'; ctx.lineWidth = 2;
+                let windLineLen = 40;
+                let wdx = Math.cos(physics.windAngle) * windLineLen;
+                let wdy = Math.sin(physics.windAngle) * windLineLen;
+                
+                for (let x = ORIGIN_X + 25; x < canvas.width; x += 100) {
+                    for (let y = 25; y < ORIGIN_Y; y += 100) {
+                        ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + wdx, y + wdy);
+                        // Đầu mũi tên
+                        ctx.lineTo(x + wdx - 10 * Math.cos(physics.windAngle - Math.PI/6), y + wdy - 10 * Math.sin(physics.windAngle - Math.PI/6));
+                        ctx.moveTo(x + wdx, y + wdy);
+                        ctx.lineTo(x + wdx - 10 * Math.cos(physics.windAngle + Math.PI/6), y + wdy - 10 * Math.sin(physics.windAngle + Math.PI/6));
+                        ctx.stroke();
+                    }
+                }
+            }
+
+            // Vẽ Vật cản
+            obstacles.forEach(o => {
+                ctx.fillStyle = 'rgba(231, 76, 60, 0.15)'; ctx.beginPath(); ctx.arc(o.x, o.y, o.r + safetyMargin, 0, Math.PI*2); ctx.fill();
+                ctx.fillStyle = '#95a5a6'; ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, Math.PI*2); ctx.fill();
+            });
+
+            // Vẽ RRT Nodes
+            if (currentAlgo === 'rrt') {
+                ctx.strokeStyle = 'rgba(46, 204, 113, 0.3)'; ctx.lineWidth = 1; ctx.beginPath();
+                for (let n of rrtNodes) { if (n.parent) { ctx.moveTo(n.x, n.y); ctx.lineTo(n.parent.x, n.parent.y); } }
+                ctx.stroke();
+            }
+
+            // Vẽ Quỹ đạo
+            if (renderPath.length > 0) {
+                if (currentAlgo === 'mpc') {
+                    // MPC: Vẽ quỹ đạo dự báo
+                    ctx.strokeStyle = '#2ecc71'; ctx.lineWidth = 3; ctx.beginPath();
+                    ctx.moveTo(uav.x, uav.y);
+                    renderPath.forEach(p => ctx.lineTo(p.x, p.y));
+                    ctx.stroke();
+                } else if (currentAlgo === 'fixedwing') {
+                    ctx.strokeStyle = '#9b59b6'; ctx.lineWidth = 3; ctx.beginPath();
+                    ctx.moveTo(uav.x, uav.y);
+                    if(renderPath.length > 1) {
+                        for (let i = currentWP; i < renderPath.length - 1; i++) {
+                            let xc = (renderPath[i].x + renderPath[i + 1].x) / 2;
+                            let yc = (renderPath[i].y + renderPath[i + 1].y) / 2;
+                            ctx.quadraticCurveTo(renderPath[i].x, renderPath[i].y, xc, yc);
+                        }
+                        ctx.lineTo(renderPath[renderPath.length-1].x, renderPath[renderPath.length-1].y);
+                    } else renderPath.slice(currentWP).forEach(p => ctx.lineTo(p.x, p.y));
+                    ctx.stroke();
+                } else {
+                    let color = currentAlgo === 'rrt' ? '#f1c40f' : '#3498db';
+                    ctx.setLineDash([8, 4]); ctx.strokeStyle = color; ctx.lineWidth = 2;
+                    ctx.beginPath(); ctx.moveTo(uav.x, uav.y);
+                    renderPath.slice(currentWP).forEach(p => ctx.lineTo(p.x, p.y));
+                    ctx.stroke(); ctx.setLineDash([]);
+                }
+            }
+
+            // Target
+            ctx.fillStyle = '#e74c3c'; ctx.beginPath(); ctx.arc(target.x, target.y, 10, 0, Math.PI*2); ctx.fill();
+
+            // Vẽ UAV Dạng Máy Bay Cánh Bằng
+            ctx.translate(uav.x, uav.y);
+            ctx.rotate(uav.theta); 
+            
+            ctx.fillStyle = currentAlgo === 'fixedwing' ? '#9b59b6' : (currentAlgo === 'rrt' ? '#f1c40f' : (currentAlgo === 'mpc' ? '#2ecc71' : '#3498db')); 
+            ctx.beginPath();
+            ctx.moveTo(12, 0);   
+            ctx.lineTo(-8, 8);   
+            ctx.lineTo(-4, 0);   
+            ctx.lineTo(-8, -8);  
+            ctx.closePath();
+            ctx.fill();
+
+            ctx.rotate(-uav.theta);
+            ctx.translate(-uav.x, -uav.y);
+
+            // Vẽ vùng an toàn xung quanh UAV
+            ctx.strokeStyle = ctx.fillStyle; ctx.beginPath(); ctx.arc(uav.x, uav.y, safetyMargin, 0, Math.PI*2); ctx.stroke();
+
+            document.getElementById('txt-dist').innerText = `Dist: ${Math.round(Math.hypot(target.x-uav.x, target.y-uav.y))}m`;
+        }
+
+        function loop() {
+            if (!isFlying) return;
+            
+            let dist = Math.hypot(target.x - uav.x, target.y - uav.y);
+
+            // XỬ LÝ MPC (Real-time Local Planner với Động lực học)
+            if (currentAlgo === 'mpc') {
+                if (dist < uav.speed * 3) { 
+                    isFlying = false; document.getElementById('txt-state').innerText = "ĐÃ TỚI ĐÍCH"; physics.vx=0; physics.vy=0; draw(); return; 
+                }
+                
+                let mpcRes = solveMPC();
+                if(mpcRes.bestPath.length === 0) {
+                    isFlying = false; document.getElementById('txt-state').innerText = "MPC BỊ KẸT! (DEAD END)"; draw(); return;
+                }
+                
+                // 1. Nhận lệnh bẻ lái từ AI
+                uav.theta += mpcRes.bestAction * 0.15;
+                
+                // 2. Tính toán lực tương tác (Thrust & Wind)
+                let thrustX = uav.speed * Math.cos(uav.theta);
+                let thrustY = uav.speed * Math.sin(uav.theta);
+                let wx = physics.windSpeed * Math.cos(physics.windAngle);
+                let wy = physics.windSpeed * Math.sin(physics.windAngle);
+
+                // 3. Cập nhật Vận tốc thực tế (Quán tính + Gia Tốc động cơ + Lực Gió)
+                physics.vx = (physics.vx * 0.9) + (thrustX / physics.mass) + (wx * 0.1);
+                physics.vy = (physics.vy * 0.9) + (thrustY / physics.mass) + (wy * 0.1);
+
+                // 4. Áp dụng vào hệ trục tọa độ
+                uav.x += physics.vx;
+                uav.y += physics.vy;
+
+                renderPath = mpcRes.bestPath; 
+                document.getElementById('txt-state').innerText = "MPC ĐANG LÁI (Tự bù Gió & Quán tính)...";
+            } 
+            // XỬ LÝ CÁC THUẬT TOÁN GRID-BASED CÒN LẠI
+            else {
+                if (currentWP >= globalPath.length) { 
+                    isFlying = false; document.getElementById('txt-state').innerText = "ĐÃ TỚI ĐÍCH"; draw(); return; 
+                }
+                
+                if (currentAlgo === 'dynamic') {
+                    let nextWP = globalPath[currentWP];
+                    if (!isPathClear(uav, nextWP)) {
+                        document.getElementById('txt-state').innerText = "VẬT CẢN ĐỘNG! ĐANG RE-PLAN...";
+                        predictTrajectory(uav);
+                        if(globalPath.length === 0) { isFlying = false; document.getElementById('txt-state').innerText = "BỊ MẮC KẸT!"; }
+                        draw(); requestAnimationFrame(loop); return;
+                    }
+                }
+
+                let wp = globalPath[currentWP];
+                let dx = wp.x - uav.x, dy = wp.y - uav.y;
+                let d = Math.hypot(dx, dy);
+                
+                if (d < uav.speed) { 
+                    currentWP++; 
+                } else { 
+                    uav.theta = Math.atan2(dy, dx); 
+                    uav.x += (dx/d)*uav.speed; 
+                    uav.y += (dy/d)*uav.speed; 
+                    document.getElementById('txt-state').innerText = "ĐANG BAY..."; 
+                }
+            }
+            
+            draw(); requestAnimationFrame(loop);
+        }
+
+        canvas.onmousedown = (e) => {
+            if (isPlanning) return; 
+            const rect = canvas.getBoundingClientRect();
+            const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+            if (mx < ORIGIN_X || my > ORIGIN_Y) return;
+            
+            if (document.querySelector('input[name="mode"]:checked').value === 'obstacle') {
+                obstacles.push({x: mx, y: my, r: Math.random() * 15 + 10});
+                if(currentAlgo !== 'mpc' && (!isFlying || currentAlgo !== 'dynamic')) predictTrajectory(isFlying ? uav : startPos);
+            } else { 
+                target.x = mx; target.y = my; 
+                if(!isFlying) {
+                    uav.theta = Math.atan2(target.y - uav.y, target.x - uav.x); 
+                }
+                if(currentAlgo !== 'mpc') predictTrajectory(isFlying ? uav : startPos);
+            }
+            draw();
+        };
+
+        document.getElementById('safetySlider').oninput = (e) => { 
+            safetyMargin = parseInt(e.target.value); 
+            document.getElementById('safetyVal').innerText = safetyMargin + "px"; 
+            if(currentAlgo !== 'mpc' && !isFlying && !isPlanning) predictTrajectory(startPos); else draw(); 
+        };
+        
+        document.getElementById('btn-start').onclick = () => { 
+            if (isPlanning) return;
+            
+            if (currentAlgo === 'mpc') {
+                if(!isFlying) { 
+                    physics.vx = 0; physics.vy = 0; // Động năng = 0 khi cất cánh
+                    isFlying = true; 
+                    loop(); 
+                }
+            } else {
+                if(currentWP >= globalPath.length || globalPath.length === 0) { 
+                    uav.x = startPos.x; uav.y = startPos.y; currentWP = 0; 
+                    predictTrajectory(startPos);
+                } 
+                if(!isFlying && globalPath.length > 0) { isFlying = true; loop(); } 
+            }
+        };
+        
+        document.getElementById('btn-reset').onclick = () => { 
+            obstacles = []; 
+            if(rrtAnimId) cancelAnimationFrame(rrtAnimId);
+            isPlanning = false; isFlying = false;
+            uav.x = startPos.x; uav.y = startPos.y;
+            physics.vx = 0; physics.vy = 0;
+            uav.theta = Math.atan2(target.y - uav.y, target.x - uav.x);
+            predictTrajectory(startPos); draw(); 
+        };
+
+        uav.theta = Math.atan2(target.y - uav.y, target.x - uav.x);
+        predictTrajectory(startPos); draw();
+    </script>
+</body>
+</html>
