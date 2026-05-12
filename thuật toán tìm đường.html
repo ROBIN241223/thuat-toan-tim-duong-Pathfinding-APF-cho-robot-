@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UAV Navigation Filter - Precision Oxy</title>
+    <style>
+        body { background-color: #1a1e23; color: white; font-family: 'Segoe UI', sans-serif; text-align: center; margin: 10px; }
+        .toolbar { background-color: #2c313a; padding: 12px; border-radius: 8px; display: inline-block; margin-bottom: 10px; text-align: left; border: 1px solid #3d4450; }
+        button { padding: 8px 16px; margin: 0 5px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; color: #fff; }
+        #btn-start { background-color: #2ecc71; }
+        #btn-reset { background-color: #e74c3c; }
+        canvas { background-color: #ffffff; border-radius: 4px; cursor: crosshair; display: block; margin: 0 auto; box-shadow: 0 0 25px rgba(0,0,0,0.6); }
+        .status-bar { background-color: #000; color: #00ff00; padding: 12px; margin-top: 10px; border: 1px solid #00bfff; border-radius: 4px; display: inline-block; font-family: 'Courier New', monospace; min-width: 850px; font-size: 14px; }
+        .filter-info { font-size: 13px; color: #f1c40f; margin-left: 15px; font-weight: bold; }
+        input[type=range] { vertical-align: middle; }
+    </style>
+</head>
+<body>
+
+    <h2>UAV Navigation Filter & Trajectory Predictor</h2>
+    
+    <div class="toolbar">
+        <button id="btn-start">🚀 Chạy Mô Phỏng</button>
+        <button id="btn-reset">🔄 Xóa/Reset</button>
+        <label><input type="radio" name="mode" value="obstacle" checked> 🧱 Vật Cản</label>
+        <label><input type="radio" name="mode" value="target"> 🎯 Điểm Đích</label>
+        <span class="filter-info">
+            📐 Filter Sải Cánh: <input type="range" id="safetySlider" min="10" max="50" value="20"> <span id="safetyVal">20px</span>
+            | 🛰️ Real-time Pos: <span id="uav-pos">(0, 0)</span>
+        </span>
+    </div>
+
+    <canvas id="simCanvas" width="900" height="500"></canvas>
+
+    <div class="status-bar">
+        <span id="txt-heading">Heading: 0°</span> | <span id="txt-dist">Dist to Target: 0m</span> | <span id="txt-state">SYSTEM READY</span>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('simCanvas');
+        const ctx = canvas.getContext('2d');
+        const uavPosEl = document.getElementById('uav-pos');
+        
+        // PARAMETERS HỆ THỐNG TỌA ĐỘ
+        const GRID = 50;     
+        const OFFSET = 50; 
+        const ORIGIN_X = OFFSET;
+        const ORIGIN_Y = canvas.height - OFFSET;
+
+        let uav = { x: 100, y: 400, speed: 4 }; 
+        let startPos = { x: 100, y: 400 };
+        let target = { x: 800, y: 100 };
+        let obstacles = [];
+        let safetyMargin = 20;
+        let isFlying = false;
+        let globalPath = [];
+        let currentWP = 0;
+
+        // KIỂM TRA VA CHẠM DỰA TRÊN VECTOR ĐƯỜNG THẲNG (Line-of-Sight Filter)
+        function isPathClear(p1, p2) {
+            let dx = p2.x - p1.x;
+            let dy = p2.y - p1.y;
+            let dist = Math.sqrt(dx*dx + dy*dy);
+            let steps = Math.ceil(dist / 2); 
+            for (let i = 0; i <= steps; i++) {
+                let t = i / steps;
+                let cx = p1.x + dx * t;
+                let cy = p1.y + dy * t;
+                for (let obs of obstacles) {
+                    if (Math.sqrt((cx - obs.x)**2 + (cy - obs.y)**2) < obs.r + safetyMargin) return false;
+                }
+            }
+            return true;
+        }
+
+        // TÍNH TOÁN QUỸ ĐẠO NGẮN NHẤT (Theta* Inspired)
+        function predictTrajectory() {
+            if (isPathClear(uav, target)) {
+                globalPath = [{x: target.x, y: target.y}];
+                currentWP = 0;
+                return;
+            }
+
+            let step = 20;
+            let openList = [{x: uav.x, y: uav.y, g: 0, h: Math.hypot(uav.x-target.x, uav.y-target.y), parent: null}];
+            let closedList = new Set();
+            let found = null;
+
+            while (openList.length > 0) {
+                openList.sort((a, b) => (a.g + a.h) - (b.g + b.h));
+                let curr = openList.shift();
+                let key = `${Math.round(curr.x/10)*10},${Math.round(curr.y/10)*10}`;
+
+                if (Math.hypot(curr.x - target.x, curr.y - target.y) < step * 1.5) {
+                    found = curr; break;
+                }
+                if (closedList.has(key)) continue;
+                closedList.add(key);
+
+                for (let dx = -step; dx <= step; dx += step) {
+                    for (let dy = -step; dy <= step; dy += step) {
+                        if (dx === 0 && dy === 0) continue;
+                        let nx = curr.x + dx, ny = curr.y + dy;
+                        if (nx > ORIGIN_X && nx < canvas.width && ny > 0 && ny < ORIGIN_Y) {
+                            if (isPathClear(curr, {x: nx, y: ny})) {
+                                let newNode = { x: nx, y: ny, g: curr.g + Math.hypot(dx, dy), h: Math.hypot(nx-target.x, ny-target.y), parent: curr };
+                                if (curr.parent && isPathClear(curr.parent, newNode)) {
+                                    newNode.parent = curr.parent;
+                                    newNode.g = curr.parent.g + Math.hypot(newNode.x - curr.parent.x, newNode.y - curr.parent.y);
+                                }
+                                openList.push(newNode);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let path = [];
+            while (found) { path.unshift({x: found.x, y: found.y}); found = found.parent; }
+            path.push({x: target.x, y: target.y});
+            
+            // Tối ưu hóa "Kéo căng" quỹ đạo
+            let smoothed = [path[0]];
+            let ci = 0;
+            while (ci < path.length - 1) {
+                let bi = ci + 1;
+                for (let i = path.length - 1; i > ci; i--) {
+                    if (isPathClear(path[ci], path[i])) { bi = i; break; }
+                }
+                smoothed.push(path[bi]);
+                ci = bi;
+            }
+            globalPath = smoothed.slice(1);
+            currentWP = 0;
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // Vẽ Filter Grid (Lưới tọa độ)
+            ctx.beginPath(); ctx.strokeStyle = "#eee"; ctx.lineWidth = 1;
+            for (let x = ORIGIN_X; x <= canvas.width; x += GRID) { ctx.moveTo(x, 0); ctx.lineTo(x, ORIGIN_Y); }
+            for (let y = ORIGIN_Y; y >= 0; y -= GRID) { ctx.moveTo(ORIGIN_X, y); ctx.lineTo(canvas.width, y); }
+            ctx.stroke();
+
+            // Vẽ Trục Oxy
+            ctx.beginPath(); ctx.strokeStyle = "#2c3e50"; ctx.lineWidth = 2;
+            ctx.moveTo(ORIGIN_X, 0); ctx.lineTo(ORIGIN_X, ORIGIN_Y); ctx.lineTo(canvas.width, ORIGIN_Y); ctx.stroke();
+
+            // Nhãn Tọa độ (Labels)
+            ctx.fillStyle = "#555"; ctx.font = "11px monospace"; ctx.textAlign = "center";
+            for (let x = ORIGIN_X; x <= canvas.width; x += GRID) ctx.fillText(x - ORIGIN_X, x, ORIGIN_Y + 18);
+            ctx.textAlign = "right";
+            for (let y = ORIGIN_Y; y >= 0; y -= GRID) ctx.fillText(ORIGIN_Y - y, ORIGIN_X - 8, y + 4);
+
+            // Vật cản & Vùng ảnh hưởng
+            obstacles.forEach(o => {
+                ctx.fillStyle = 'rgba(231, 76, 60, 0.1)'; ctx.beginPath(); ctx.arc(o.x, o.y, o.r + safetyMargin, 0, Math.PI*2); ctx.fill();
+                ctx.fillStyle = '#95a5a6'; ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, Math.PI*2); ctx.fill();
+            });
+
+            // Dự đoán đường bay (Predicted Path)
+            if (globalPath.length > 0) {
+                ctx.setLineDash([8, 4]); ctx.strokeStyle = '#3498db'; ctx.lineWidth = 2;
+                ctx.beginPath(); ctx.moveTo(uav.x, uav.y);
+                globalPath.slice(currentWP).forEach(p => ctx.lineTo(p.x, p.y));
+                ctx.stroke(); ctx.setLineDash([]);
+            }
+
+            // UAV & Target
+            ctx.fillStyle = '#e74c3c'; ctx.beginPath(); ctx.arc(target.x, target.y, 10, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle = '#3498db'; ctx.beginPath(); ctx.arc(uav.x, uav.y, 7, 0, Math.PI*2); ctx.fill();
+            ctx.strokeStyle = '#3498db'; ctx.beginPath(); ctx.arc(uav.x, uav.y, safetyMargin, 0, Math.PI*2); ctx.stroke();
+
+            // Cập nhật Pos thực
+            uavPosEl.innerText = `(${Math.round(uav.x - ORIGIN_X)}, ${Math.round(ORIGIN_Y - uav.y)})`;
+            document.getElementById('txt-dist').innerText = `Dist to Target: ${Math.round(Math.hypot(target.x-uav.x, target.y-uav.y))}m`;
+        }
+
+        function loop() {
+            if (!isFlying || currentWP >= globalPath.length) { isFlying = false; draw(); return; }
+            let wp = globalPath[currentWP];
+            let dx = wp.x - uav.x, dy = wp.y - uav.y;
+            let d = Math.hypot(dx, dy);
+            if (d < 3) currentWP++;
+            else {
+                uav.x += (dx/d)*uav.speed; uav.y += (dy/d)*uav.speed;
+                document.getElementById('txt-heading').innerText = `Heading: ${Math.round((Math.atan2(-dy, dx)*180/Math.PI + 360)%360)}°`;
+            }
+            draw(); requestAnimationFrame(loop);
+        }
+
+        canvas.onmousedown = (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+            if (mx < ORIGIN_X || my > ORIGIN_Y) return;
+            if (document.querySelector('input[name="mode"]:checked').value === 'obstacle') obstacles.push({x: mx, y: my, r: 15});
+            else { target.x = mx; target.y = my; }
+            predictTrajectory(); draw();
+        };
+
+        safetySlider.oninput = (e) => { safetyMargin = parseInt(e.target.value); document.getElementById('safetyVal').innerText = safetyMargin + "px"; predictTrajectory(); draw(); };
+        document.getElementById('btn-start').onclick = () => { if(currentWP >= globalPath.length) { uav.x = startPos.x; uav.y = startPos.y; currentWP = 0; } if(!isFlying) { isFlying = true; loop(); } };
+        document.getElementById('btn-reset').onclick = () => { location.reload(); };
+
+        predictTrajectory(); draw();
+    </script>
+</body>
+</html>
